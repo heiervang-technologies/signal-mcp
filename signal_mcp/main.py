@@ -17,6 +17,8 @@ import json
 import socket
 from pathlib import Path
 import time
+from collections import deque
+from typing import Deque
 
 # Set up logging with more detailed format
 logging.basicConfig(
@@ -321,6 +323,156 @@ class SignalDaemonConnection:
         return messages
 
 
+class SignalMessageListener:
+    """Persistent listener for incoming Signal messages.
+
+    Maintains a dedicated connection to the daemon that continuously
+    listens for push notifications and queues them for processing.
+    """
+
+    def __init__(self, host: str, port: int, user_id: str):
+        self.host = host
+        self.port = port
+        self.user_id = user_id
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self.message_queue: Deque[Dict[str, Any]] = deque(maxlen=1000)
+        self._listener_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._new_message_event = asyncio.Event()
+        logger.info(f"Initialized message listener for {host}:{port}")
+
+    async def start(self) -> None:
+        """Start the persistent listener."""
+        if self._running:
+            logger.debug("Listener already running")
+            return
+
+        try:
+            logger.info(f"Starting persistent listener on {self.host}:{self.port}")
+            self.reader, self.writer = await asyncio.open_connection(
+                self.host, self.port
+            )
+            self._running = True
+            self._listener_task = asyncio.create_task(self._listen_loop())
+            logger.info("Persistent listener started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start listener: {e}")
+            raise SignalCLIError(f"Failed to start listener: {e}")
+
+    async def stop(self) -> None:
+        """Stop the persistent listener."""
+        self._running = False
+        if self._listener_task:
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except asyncio.CancelledError:
+                pass
+        if self.writer:
+            self.writer.close()
+            await self.writer.wait_closed()
+        logger.info("Persistent listener stopped")
+
+    async def _listen_loop(self) -> None:
+        """Background loop that continuously reads notifications."""
+        logger.info("Listener loop started")
+        while self._running:
+            try:
+                if not self.reader:
+                    logger.warning("Reader not available, reconnecting...")
+                    await asyncio.sleep(1)
+                    await self.start()
+                    continue
+
+                line = await self.reader.readline()
+                if not line:
+                    logger.warning("Daemon closed connection, reconnecting...")
+                    self._running = False
+                    await asyncio.sleep(1)
+                    await self.start()
+                    continue
+
+                try:
+                    notification = json.loads(line.decode())
+                    logger.debug(f"Listener received: {notification}")
+
+                    # Check if it's a receive notification with a message
+                    if notification.get("method") == "receive":
+                        params = notification.get("params", {})
+                        envelope = params.get("envelope", {})
+                        data_message = envelope.get("dataMessage", {})
+
+                        # Only queue if there's an actual message body
+                        if data_message.get("message"):
+                            self.message_queue.append(params)
+                            self._new_message_event.set()
+                            logger.info(f"Queued message, queue size: {len(self.message_queue)}")
+
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to decode notification: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("Listener loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in listener loop: {e}")
+                await asyncio.sleep(1)
+
+    async def wait_for_message(self, timeout: float, from_user: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Wait for a message, optionally from a specific user.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            from_user: Optional username or phone number to filter by
+
+        Returns:
+            Message dict or None if timeout
+        """
+        # Ensure listener is running
+        if not self._running:
+            await self.start()
+
+        start_time = time.time()
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                logger.debug("Wait timeout reached")
+                return None
+
+            # Check queue for matching messages
+            for i, msg in enumerate(self.message_queue):
+                envelope = msg.get("envelope", {})
+                source = envelope.get("source") or envelope.get("sourceNumber")
+                source_uuid = envelope.get("sourceUuid")
+
+                # Check if message matches filter
+                if from_user is None:
+                    # No filter, return first message
+                    self.message_queue.remove(msg)
+                    return msg
+                else:
+                    # Check various sender identifiers
+                    if source == from_user or source_uuid == from_user:
+                        self.message_queue.remove(msg)
+                        return msg
+                    # Also check username cache
+                    cached_username = username_cache.get_username(source_uuid) if source_uuid else None
+                    if cached_username == from_user:
+                        self.message_queue.remove(msg)
+                        return msg
+
+            # No matching message in queue, wait for new ones
+            self._new_message_event.clear()
+            remaining = timeout - elapsed
+            try:
+                await asyncio.wait_for(self._new_message_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.debug("Wait for new message timed out")
+                return None
+
+
 SuccessResponse = Dict[str, str]
 ErrorResponse = Dict[str, str]
 
@@ -328,6 +480,7 @@ ErrorResponse = Dict[str, str]
 config = SignalConfig()
 username_cache = UsernameCache()
 daemon_connection: Optional[SignalDaemonConnection] = None
+message_listener: Optional[SignalMessageListener] = None
 
 
 def _get_daemon() -> SignalDaemonConnection:
@@ -338,6 +491,16 @@ def _get_daemon() -> SignalDaemonConnection:
             config.daemon_host, config.daemon_port, config.user_id
         )
     return daemon_connection
+
+
+def _get_listener() -> SignalMessageListener:
+    """Get or create the persistent message listener."""
+    global message_listener
+    if message_listener is None:
+        message_listener = SignalMessageListener(
+            config.daemon_host, config.daemon_port, config.user_id
+        )
+    return message_listener
 
 
 async def _run_signal_cli(cmd: str) -> Tuple[str, str, int | None]:
@@ -642,8 +805,9 @@ async def wait_for_message(
 ) -> MessageResponse:
     """Block and wait for a new message to arrive from a specific user or any user.
 
-    This tool uses the daemon's push notifications to efficiently wait for messages.
-    It's designed for agent loops where Claude needs to wait for user input.
+    This tool uses a persistent listener with push notifications to efficiently
+    wait for messages. The listener runs in the background and queues incoming
+    messages for immediate retrieval.
 
     Args:
         from_user: Optional phone number to filter messages from (e.g., "+1234567890").
@@ -668,71 +832,32 @@ async def wait_for_message(
         return MessageResponse(error=error_msg)
 
     try:
-        daemon = _get_daemon()
-        start_time = time.time()
+        listener = _get_listener()
 
-        # Keep reading notifications until we find a matching message or timeout
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= max_wait_seconds:
-                error_msg = f"No message received within {max_wait_seconds} seconds"
-                logger.info(error_msg)
-                return MessageResponse(error=error_msg)
+        # Wait for a message using the persistent listener
+        msg = await listener.wait_for_message(
+            timeout=float(max_wait_seconds),
+            from_user=from_user
+        )
 
-            remaining = max_wait_seconds - elapsed
-            logger.debug(
-                f"Waiting for messages (elapsed: {elapsed:.1f}s/{max_wait_seconds}s)"
+        if msg is None:
+            error_msg = f"No message received within {max_wait_seconds} seconds"
+            logger.info(error_msg)
+            return MessageResponse(error=error_msg)
+
+        # Parse the message
+        result = _parse_daemon_notification(msg)
+
+        if result and result.message:
+            logger.info(
+                f"Received message from {result.sender_id}: {result.message}"
+                + (f" in group {result.group_name}" if result.group_name else "")
             )
-
-            # Receive with remaining timeout
-            notifications = await daemon.receive_messages(timeout=remaining)
-
-            # Process each notification
-            for notification in notifications:
-                result = _parse_daemon_notification(notification)
-
-                # Only process if we have a message body
-                if result and result.message:
-                    # Check if we need to filter by sender
-                    if from_user:
-                        # Try to match by phone number or cached UUID
-                        sender_matches = result.sender_id == from_user
-
-                        # Also check if sender_id is a UUID and we have cached username
-                        if not sender_matches and result.sender_id:
-                            cached_username = username_cache.get_username(result.sender_id)
-                            if cached_username == from_user:
-                                sender_matches = True
-
-                        if sender_matches:
-                            logger.info(
-                                f"Received message from specified user {from_user}: {result.message}"
-                                + (
-                                    f" in group {result.group_name}"
-                                    if result.group_name
-                                    else ""
-                                )
-                            )
-                            return result
-                        else:
-                            logger.debug(
-                                f"Ignoring message from {result.sender_id} "
-                                f"(waiting for {from_user})"
-                            )
-                    else:
-                        # No filter, return the first message we get
-                        logger.info(
-                            f"Received message from {result.sender_id}: {result.message}"
-                            + (
-                                f" in group {result.group_name}"
-                                if result.group_name
-                                else ""
-                            )
-                        )
-                        return result
-
-            # If no matching messages in this batch, continue waiting
-            logger.debug("No matching messages in this batch, continuing to wait")
+            return result
+        else:
+            error_msg = "Received message but couldn't parse it"
+            logger.error(error_msg)
+            return MessageResponse(error=error_msg)
 
     except Exception as e:
         logger.error(f"Error in wait_for_message: {str(e)}", exc_info=True)
