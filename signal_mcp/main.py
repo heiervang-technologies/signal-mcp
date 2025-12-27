@@ -236,7 +236,8 @@ class SignalDaemonConnection:
 
         Args:
             message: The message to send
-            recipient: Username or phone number (e.g., "msh.60" or "+1234567890")
+            recipient: Phone number, username (with u: prefix), or UUID
+                      e.g., "+1234567890", "u:msh.60", "e6cdcf80-e4ab-4c5a-9b4c-4627f53fa824"
             group_id: Group ID (base64 encoded)
 
         Returns:
@@ -245,11 +246,18 @@ class SignalDaemonConnection:
         params = {"message": message, "account": self.user_id}
 
         if recipient:
-            # Check if it's a username (doesn't start with +)
-            if not recipient.startswith("+"):
-                params["username"] = [recipient]
-            else:
+            if recipient.startswith("+"):
+                # Phone number
                 params["recipient"] = [recipient]
+            elif recipient.startswith("u:"):
+                # Username with u: prefix - strip prefix for API
+                params["recipient"] = [recipient]
+            elif len(recipient) == 36 and recipient.count("-") == 4:
+                # UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+                params["recipient"] = [recipient]
+            else:
+                # Assume it's a username without prefix, add u: prefix
+                params["recipient"] = [f"u:{recipient}"]
         elif group_id:
             params["groupId"] = group_id
         else:
