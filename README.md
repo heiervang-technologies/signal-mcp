@@ -2,6 +2,12 @@
 
 An MCP server that enables AI agents to send and receive Signal messages via [signal-cli](https://github.com/AsamK/signal-cli).
 
+## Prerequisites
+
+- **Python 3.13+** (required for the MCP server)
+- **uv** (Python package manager) - Install from [astral.sh/uv](https://astral.sh/uv)
+- **signal-cli** (installed in step 1 below)
+
 ## Features
 
 - Send messages to Signal users (by phone number, username, or UUID)
@@ -49,7 +55,8 @@ signal-cli -u +YOUR_PHONE_NUMBER verify CODE_FROM_SMS
 
 ```bash
 cd /path/to/signal-mcp
-uv venv
+uv venv --python 3.13
+source .venv/bin/activate
 uv pip install -e .
 ```
 
@@ -80,6 +87,32 @@ Add to `~/.mcp.json`:
 ```
 
 Then restart Claude Code to pick up the new MCP server.
+
+### 6. Verify Your Setup
+
+Test that the daemon is running and accepting connections:
+
+```bash
+# Check if the daemon is listening on port 7583
+nc -zv localhost 7583
+
+# Or test with a simple JSON-RPC call
+echo '{"jsonrpc":"2.0","method":"listAccounts","id":1}' | nc localhost 7583
+```
+
+You should see a response with your registered account. If the connection is refused, make sure the daemon is running (step 4).
+
+## Recipient Formats
+
+When sending messages, you can specify recipients in different formats:
+
+| Format | Example | When to Use |
+|--------|---------|-------------|
+| Phone number | `+1234567890` | Most reliable; works for any Signal user |
+| Username | `u:alice` | When you know the recipient's Signal username |
+| UUID | `a1b2c3d4-...` | For programmatic use; never changes |
+
+**Note**: Usernames must be prefixed with `u:` to distinguish them from phone numbers.
 
 ## API
 
