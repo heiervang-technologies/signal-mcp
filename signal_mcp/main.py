@@ -6,16 +6,19 @@
 # ]
 # ///
 from mcp.server.fastmcp import FastMCP
-from typing import Optional, Tuple, Dict, Union, Any
+from typing import Optional, Tuple, Dict, Union, Any, List
 import asyncio
 import subprocess
 import shlex
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import json
 import socket
+import os
+import re
 from pathlib import Path
+from datetime import datetime
 import time
 from collections import deque
 from typing import Deque
@@ -921,6 +924,370 @@ async def wait_for_message(
     except Exception as e:
         logger.error(f"Error in wait_for_message: {str(e)}", exc_info=True)
         return MessageResponse(error=str(e))
+
+
+# =============================================================================
+# Message History from Log
+# =============================================================================
+
+@dataclass
+class HistoryMessage:
+    """A message from the signal-cli daemon log."""
+    sender_name: str
+    sender_uuid: str
+    timestamp: int
+    timestamp_iso: str
+    body: str
+
+
+def _get_allowed_senders() -> Optional[List[str]]:
+    """Get list of allowed senders from environment variable.
+
+    Set SIGNAL_ALLOWED_SENDERS as comma-separated list of usernames, UUIDs, or phone numbers.
+    Example: SIGNAL_ALLOWED_SENDERS="alice.01,bob.02,+15551234567"
+
+    Returns None if not set (allow all senders).
+    """
+    allowed = os.environ.get("SIGNAL_ALLOWED_SENDERS", "").strip()
+    if not allowed:
+        return None
+    return [s.strip() for s in allowed.split(",") if s.strip()]
+
+
+def _is_sender_allowed(
+    sender_uuid: str,
+    sender_name: str,
+    allowed_senders: Optional[List[str]]
+) -> bool:
+    """Check if a sender is in the whitelist.
+
+    Args:
+        sender_uuid: The sender's UUID
+        sender_name: The sender's display name
+        allowed_senders: List of allowed identifiers, or None to allow all
+
+    Returns:
+        True if sender is allowed
+    """
+    if allowed_senders is None:
+        return True
+
+    # Check UUID
+    if sender_uuid in allowed_senders:
+        return True
+
+    # Check display name
+    if sender_name in allowed_senders:
+        return True
+
+    # Check if we can resolve sender to username and match
+    # The username might be cached
+    cached_username = username_cache.get_username(sender_uuid)
+    if cached_username and cached_username in allowed_senders:
+        return True
+
+    return False
+
+
+def _parse_signal_log(
+    log_path: str = "/tmp/signal-cli-daemon.log",
+    since_timestamp: Optional[int] = None,
+    from_user: Optional[str] = None,
+    limit: int = 100
+) -> List[HistoryMessage]:
+    """Parse the signal-cli daemon log file for message history.
+
+    Args:
+        log_path: Path to the daemon log file
+        since_timestamp: Only return messages after this timestamp (ms since epoch)
+        from_user: Filter to messages from this sender (UUID, username, or display name)
+        limit: Maximum number of messages to return
+
+    Returns:
+        List of HistoryMessage objects, newest first
+    """
+    messages: List[HistoryMessage] = []
+    allowed_senders = _get_allowed_senders()
+
+    try:
+        with open(log_path, 'r') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        logger.warning(f"Signal daemon log not found: {log_path}")
+        return []
+    except Exception as e:
+        logger.error(f"Error reading signal log: {e}")
+        return []
+
+    # Parse log entries - they span multiple lines
+    # Format:
+    # Envelope from: "Display Name" uuid (device: N) to +phone
+    # Timestamp: 1234567890123 (2025-01-01T12:00:00.000Z)
+    # ...
+    # Body: message text
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Look for envelope start
+        # Note: signal-cli uses curly quotes (Unicode U+201C/U+201D) not ASCII "
+        envelope_match = re.match(
+            r'Envelope from: ["\u201c\u201d]([^"\u201c\u201d]*)["\u201c\u201d] ([a-f0-9-]{36}) \(device: \d+\)',
+            line
+        )
+        if envelope_match:
+            sender_name = envelope_match.group(1)
+            sender_uuid = envelope_match.group(2)
+
+            # Look for timestamp and body in next lines
+            timestamp = None
+            timestamp_iso = None
+            body = None
+
+            j = i + 1
+            while j < len(lines) and j < i + 10:  # Look ahead up to 10 lines
+                next_line = lines[j]
+
+                # Check for next envelope (end of this message)
+                if next_line.startswith("Envelope from:"):
+                    break
+
+                # Parse timestamp
+                ts_match = re.match(r'Timestamp: (\d+) \(([^)]+)\)', next_line)
+                if ts_match:
+                    timestamp = int(ts_match.group(1))
+                    timestamp_iso = ts_match.group(2)
+
+                # Parse body
+                if next_line.startswith("Body: "):
+                    body = next_line[6:].rstrip()
+
+                j += 1
+
+            # Only add if we have a body (actual message, not just envelope)
+            if body and timestamp:
+                # Apply whitelist filter
+                if not _is_sender_allowed(sender_uuid, sender_name, allowed_senders):
+                    logger.debug(f"Skipping message from non-whitelisted sender: {sender_name}")
+                    i = j
+                    continue
+
+                # Apply timestamp filter
+                if since_timestamp and timestamp <= since_timestamp:
+                    i = j
+                    continue
+
+                # Apply sender filter
+                if from_user:
+                    if not (
+                        sender_uuid == from_user or
+                        sender_name == from_user or
+                        username_cache.get_username(sender_uuid) == from_user
+                    ):
+                        i = j
+                        continue
+
+                messages.append(HistoryMessage(
+                    sender_name=sender_name,
+                    sender_uuid=sender_uuid,
+                    timestamp=timestamp,
+                    timestamp_iso=timestamp_iso,
+                    body=body
+                ))
+
+            i = j
+        else:
+            i += 1
+
+    # Sort by timestamp descending (newest first) and limit
+    messages.sort(key=lambda m: m.timestamp, reverse=True)
+    return messages[:limit]
+
+
+@dataclass
+class MessageHistoryResponse:
+    """Response from get_message_history tool."""
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    count: int = 0
+    error: Optional[str] = None
+
+
+@mcp.tool()
+async def get_message_history(
+    since_timestamp: Optional[int] = None,
+    from_user: Optional[str] = None,
+    limit: int = 50
+) -> MessageHistoryResponse:
+    """Get message history from the signal-cli daemon log.
+
+    Parses the daemon log file to retrieve past messages. Messages are filtered
+    by the SIGNAL_ALLOWED_SENDERS environment variable if set.
+
+    Args:
+        since_timestamp: Only return messages after this timestamp (milliseconds since epoch).
+                        Use this to get only new messages since last check.
+        from_user: Filter to messages from a specific sender. Accepts:
+                   - Signal username (e.g., "alice.01")
+                   - UUID (e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+                   - Display name (e.g., "Alice Smith")
+        limit: Maximum number of messages to return (default: 50, max: 500)
+
+    Returns:
+        MessageHistoryResponse with list of messages (newest first), count, and optional error.
+        Each message contains: sender_name, sender_uuid, timestamp, timestamp_iso, body
+
+    Environment:
+        SIGNAL_ALLOWED_SENDERS: Comma-separated whitelist of allowed senders.
+                                If not set, all senders are allowed.
+                                Example: "alice.01,bob.02,+15551234567"
+    """
+    logger.info(
+        f"Tool called: get_message_history"
+        + (f" since={since_timestamp}" if since_timestamp else "")
+        + (f" from={from_user}" if from_user else "")
+        + f" limit={limit}"
+    )
+
+    # Validate limit
+    limit = min(max(1, limit), 500)
+
+    try:
+        # Resolve from_user to UUID if specified
+        resolved_user: Optional[str] = None
+        if from_user:
+            daemon = _get_daemon()
+            resolved_uuid = await daemon.resolve_identifier(from_user)
+            # Use resolved UUID if available, otherwise use original (might be display name)
+            resolved_user = resolved_uuid if resolved_uuid else from_user
+
+        messages = _parse_signal_log(
+            since_timestamp=since_timestamp,
+            from_user=resolved_user,
+            limit=limit
+        )
+
+        # Convert to dicts for JSON serialization
+        message_dicts = [
+            {
+                "sender_name": m.sender_name,
+                "sender_uuid": m.sender_uuid,
+                "timestamp": m.timestamp,
+                "timestamp_iso": m.timestamp_iso,
+                "body": m.body
+            }
+            for m in messages
+        ]
+
+        logger.info(f"Returning {len(message_dicts)} messages from history")
+        return MessageHistoryResponse(
+            messages=message_dicts,
+            count=len(message_dicts)
+        )
+
+    except Exception as e:
+        logger.error(f"Error in get_message_history: {str(e)}", exc_info=True)
+        return MessageHistoryResponse(error=str(e))
+
+
+@dataclass
+class Chat:
+    """Represents a chat (DM or group)."""
+    chat_id: str  # UUID for DMs, group ID for groups
+    chat_type: str  # "dm" or "group"
+    name: str  # Display name or group name
+    username: Optional[str] = None  # Signal username if available (DMs only)
+
+
+@dataclass
+class ListChatsResponse:
+    """Response from list_chats tool."""
+    chats: List[Dict[str, Any]] = field(default_factory=list)
+    count: int = 0
+    error: Optional[str] = None
+
+
+@mcp.tool()
+async def list_chats() -> ListChatsResponse:
+    """List all chats (DMs and groups) the account is involved with.
+
+    Returns both direct message contacts and group chats. For DMs, includes
+    the contact's username and profile name. For groups, includes the group
+    name and member count.
+
+    Returns:
+        ListChatsResponse with list of chats, count, and optional error.
+        Each chat contains: chat_id, chat_type ("dm" or "group"), name, username (for DMs)
+    """
+    logger.info("Tool called: list_chats")
+
+    try:
+        daemon = _get_daemon()
+        chats: List[Chat] = []
+
+        # Get groups
+        try:
+            groups_result = await daemon._send_request("listGroups", {"account": config.user_id})
+            if isinstance(groups_result, list):
+                for group in groups_result:
+                    group_id = group.get("id") or group.get("groupId", "")
+                    group_name = group.get("name", "Unnamed Group")
+                    chats.append(Chat(
+                        chat_id=group_id,
+                        chat_type="group",
+                        name=group_name
+                    ))
+                logger.info(f"Found {len(groups_result)} groups")
+        except Exception as e:
+            logger.warning(f"Failed to list groups: {e}")
+
+        # Get contacts (DMs)
+        try:
+            contacts_result = await daemon._send_request("listContacts", {"account": config.user_id})
+            if isinstance(contacts_result, list):
+                for contact in contacts_result:
+                    uuid = contact.get("uuid", "")
+                    username = contact.get("username")
+                    profile = contact.get("profile", {})
+
+                    # Build display name from profile or username
+                    given_name = profile.get("givenName", "")
+                    family_name = profile.get("familyName", "")
+                    display_name = f"{given_name} {family_name}".strip()
+                    if not display_name:
+                        display_name = username or contact.get("name") or uuid[:8]
+
+                    if uuid:  # Only add if we have a UUID
+                        chats.append(Chat(
+                            chat_id=uuid,
+                            chat_type="dm",
+                            name=display_name,
+                            username=username
+                        ))
+                logger.info(f"Found {len(contacts_result)} contacts")
+        except Exception as e:
+            logger.warning(f"Failed to list contacts: {e}")
+
+        # Convert to dicts
+        chat_dicts = [
+            {
+                "chat_id": c.chat_id,
+                "chat_type": c.chat_type,
+                "name": c.name,
+                "username": c.username
+            }
+            for c in chats
+        ]
+
+        logger.info(f"Returning {len(chat_dicts)} chats")
+        return ListChatsResponse(
+            chats=chat_dicts,
+            count=len(chat_dicts)
+        )
+
+    except Exception as e:
+        logger.error(f"Error in list_chats: {str(e)}", exc_info=True)
+        return ListChatsResponse(error=str(e))
 
 
 def initialize_server() -> SignalConfig:
