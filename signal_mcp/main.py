@@ -229,6 +229,49 @@ class SignalDaemonConnection:
                 logger.error(f"Error during JSON-RPC call: {e}")
                 raise SignalCLIError(f"JSON-RPC call failed: {e}")
 
+    async def resolve_identifier(self, identifier: str) -> Optional[str]:
+        """Resolve a username or phone number to a UUID.
+
+        Args:
+            identifier: A Signal username (e.g., "msh.60"), phone number (e.g., "+1234567890"),
+                       or UUID. Usernames can optionally have "u:" prefix.
+
+        Returns:
+            UUID string if resolved, None if not found or error
+        """
+        # If already a UUID, return as-is
+        if len(identifier) == 36 and identifier.count("-") == 4:
+            logger.debug(f"Identifier {identifier} is already a UUID")
+            return identifier
+
+        # Strip u: prefix if present
+        clean_id = identifier[2:] if identifier.startswith("u:") else identifier
+
+        try:
+            if clean_id.startswith("+"):
+                # Phone number - use recipient param
+                params = {"account": self.user_id, "recipient": [clean_id]}
+            else:
+                # Username - use username param
+                params = {"account": self.user_id, "username": [clean_id]}
+
+            result = await self._send_request("getUserStatus", params)
+            logger.debug(f"getUserStatus result: {result}")
+
+            if isinstance(result, list) and len(result) > 0:
+                user_info = result[0]
+                uuid = user_info.get("uuid")
+                if uuid and user_info.get("isRegistered", False):
+                    logger.info(f"Resolved {identifier} to UUID {uuid}")
+                    return uuid
+                else:
+                    logger.warning(f"User {identifier} not registered or no UUID: {user_info}")
+                    return None
+            return None
+        except Exception as e:
+            logger.error(f"Failed to resolve identifier {identifier}: {e}")
+            return None
+
     async def send_message(
         self, message: str, recipient: Optional[str] = None, group_id: Optional[str] = None
     ) -> bool:
@@ -452,7 +495,6 @@ class SignalMessageListener:
             # Check queue for matching messages
             for i, msg in enumerate(self.message_queue):
                 envelope = msg.get("envelope", {})
-                source = envelope.get("source") or envelope.get("sourceNumber")
                 source_uuid = envelope.get("sourceUuid")
 
                 # Check if message matches filter
@@ -461,13 +503,8 @@ class SignalMessageListener:
                     self.message_queue.remove(msg)
                     return msg
                 else:
-                    # Check various sender identifiers
-                    if source == from_user or source_uuid == from_user:
-                        self.message_queue.remove(msg)
-                        return msg
-                    # Also check username cache
-                    cached_username = username_cache.get_username(source_uuid) if source_uuid else None
-                    if cached_username == from_user:
+                    # from_user should be a resolved UUID at this point
+                    if source_uuid == from_user:
                         self.message_queue.remove(msg)
                         return msg
 
@@ -818,7 +855,10 @@ async def wait_for_message(
     messages for immediate retrieval.
 
     Args:
-        from_user: Optional phone number to filter messages from (e.g., "+1234567890").
+        from_user: Optional identifier to filter messages from. Accepts:
+                   - Signal username (e.g., "msh.60" or "u:msh.60")
+                   - Phone number (e.g., "+1234567890")
+                   - UUID (e.g., "e6cdcf80-e4ab-4c5a-9b4c-4627f53fa824")
                    If None, accepts messages from any user.
         max_wait_seconds: Maximum time to wait in seconds (default: 3600 = 1 hour).
                           Must be between 1 and 7200 (2 hours).
@@ -840,12 +880,23 @@ async def wait_for_message(
         return MessageResponse(error=error_msg)
 
     try:
+        # Resolve from_user to UUID if specified
+        resolved_user: Optional[str] = None
+        if from_user:
+            daemon = _get_daemon()
+            resolved_user = await daemon.resolve_identifier(from_user)
+            if resolved_user is None:
+                error_msg = f"Could not resolve user '{from_user}' - user may not exist or is not registered"
+                logger.error(error_msg)
+                return MessageResponse(error=error_msg)
+            logger.info(f"Resolved '{from_user}' to UUID: {resolved_user}")
+
         listener = _get_listener()
 
-        # Wait for a message using the persistent listener
+        # Wait for a message using the persistent listener (filter by resolved UUID)
         msg = await listener.wait_for_message(
             timeout=float(max_wait_seconds),
-            from_user=from_user
+            from_user=resolved_user
         )
 
         if msg is None:
