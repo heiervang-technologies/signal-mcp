@@ -848,6 +848,95 @@ async def receive_message(timeout: float) -> MessageResponse:
 
 
 @mcp.tool()
+async def send_and_await_reply(
+    message: str,
+    user_id: str,
+    timeout_seconds: int = 60
+) -> MessageResponse:
+    """Send a message to a user and wait for their reply in one atomic operation.
+
+    This is a convenience tool that combines send_message_to_user and wait_for_message.
+    It sends a message and then waits for a reply from the same user.
+
+    Args:
+        message: The message to send to the user.
+        user_id: The recipient's identifier. Accepts:
+                 - Signal username (e.g., "msh.60" or "u:msh.60")
+                 - Phone number (e.g., "+1234567890")
+                 - UUID (e.g., "e6cdcf80-e4ab-4c5a-9b4c-4627f53fa824")
+        timeout_seconds: Maximum time to wait for a reply in seconds (default: 60).
+                         Must be between 1 and 7200 (2 hours).
+
+    Returns:
+        MessageResponse with the reply message content, sender_id, timestamp, and optionally group_name.
+        Returns error if sending fails, timeout is exceeded, or an error occurs.
+    """
+    logger.info(
+        f"Tool called: send_and_await_reply to user {user_id} "
+        f"(timeout: {timeout_seconds}s)"
+    )
+
+    # Validate timeout
+    if timeout_seconds < 1 or timeout_seconds > 7200:
+        error_msg = "timeout_seconds must be between 1 and 7200 (2 hours)"
+        logger.error(error_msg)
+        return MessageResponse(error=error_msg)
+
+    try:
+        daemon = _get_daemon()
+
+        # Resolve user_id to UUID first (needed for filtering replies)
+        resolved_user = await daemon.resolve_identifier(user_id)
+        if resolved_user is None:
+            error_msg = f"Could not resolve user '{user_id}' - user may not exist or is not registered"
+            logger.error(error_msg)
+            return MessageResponse(error=error_msg)
+        logger.info(f"Resolved '{user_id}' to UUID: {resolved_user}")
+
+        # Start the listener before sending to avoid missing quick replies
+        listener = _get_listener()
+        if not listener._running:
+            await listener.start()
+
+        # Send the message
+        success = await daemon.send_message(message, recipient=user_id)
+        if not success:
+            error_msg = f"Failed to send message to {user_id}"
+            logger.error(error_msg)
+            return MessageResponse(error=error_msg)
+        logger.info(f"Message sent to {user_id}, now waiting for reply...")
+
+        # Wait for reply from the same user
+        msg = await listener.wait_for_message(
+            timeout=float(timeout_seconds),
+            from_user=resolved_user
+        )
+
+        if msg is None:
+            error_msg = f"No reply received from {user_id} within {timeout_seconds} seconds"
+            logger.info(error_msg)
+            return MessageResponse(error=error_msg)
+
+        # Parse the reply
+        result = _parse_daemon_notification(msg)
+
+        if result and result.message:
+            logger.info(
+                f"Received reply from {result.sender_id}: {result.message}"
+                + (f" in group {result.group_name}" if result.group_name else "")
+            )
+            return result
+        else:
+            error_msg = "Received reply but couldn't parse it"
+            logger.error(error_msg)
+            return MessageResponse(error=error_msg)
+
+    except Exception as e:
+        logger.error(f"Error in send_and_await_reply: {str(e)}", exc_info=True)
+        return MessageResponse(error=str(e))
+
+
+@mcp.tool()
 async def wait_for_message(
     from_user: Optional[str] = None, max_wait_seconds: int = 3600
 ) -> MessageResponse:
@@ -1296,7 +1385,9 @@ def initialize_server() -> SignalConfig:
 
     parser = argparse.ArgumentParser(description="Run the Signal MCP server")
     parser.add_argument(
-        "--user-id", required=True, help="Signal phone number for the user"
+        "--user-id",
+        default=os.environ.get("SIGNAL_USER"),
+        help="Signal phone number for the user (or set SIGNAL_USER env var)"
     )
     parser.add_argument(
         "--transport",
@@ -1306,6 +1397,10 @@ def initialize_server() -> SignalConfig:
     )
 
     args = parser.parse_args()
+
+    if not args.user_id:
+        parser.error("--user-id is required (or set SIGNAL_USER environment variable)")
+
     logger.info(f"Parsed arguments: user_id={args.user_id}, transport={args.transport}")
 
     # Set global config
