@@ -317,6 +317,44 @@ class SignalDaemonConnection:
             logger.error(f"Failed to send message: {e}")
             return False
 
+    async def send_reaction(
+        self, recipient: str, target_timestamp: int, emoji: str
+    ) -> bool:
+        """Send a reaction to a message via the daemon.
+
+        Args:
+            recipient: Phone number, username (with u: prefix), or UUID
+            target_timestamp: Timestamp of the message to react to
+            emoji: The emoji to react with (e.g., "👍")
+
+        Returns:
+            True if successful
+        """
+        # Format recipient
+        if recipient.startswith("+"):
+            formatted_recipient = recipient
+        elif recipient.startswith("u:"):
+            formatted_recipient = recipient
+        elif len(recipient) == 36 and recipient.count("-") == 4:
+            formatted_recipient = recipient
+        else:
+            formatted_recipient = f"u:{recipient}"
+
+        params = {
+            "account": self.user_id,
+            "recipient": [formatted_recipient],
+            "targetTimestamp": target_timestamp,
+            "emoji": emoji,
+        }
+
+        try:
+            await self._send_request("sendReaction", params)
+            logger.info(f"Successfully sent reaction {emoji} via daemon")
+            return True
+        except SignalCLIError as e:
+            logger.error(f"Failed to send reaction: {e}")
+            return False
+
     async def receive_messages(self, timeout: Optional[float] = None) -> list:
         """Receive messages from the daemon.
 
@@ -813,6 +851,38 @@ async def send_message_to_group(
         return {"error": "Failed to send message"}
     except Exception as e:
         logger.error(f"Error in send_message_to_group: {str(e)}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def send_reaction(
+    user_id: str, target_timestamp: int, emoji: str = "👍"
+) -> Union[SuccessResponse, ErrorResponse]:
+    """Send a reaction (emoji) to a message.
+
+    Args:
+        user_id: The user who sent the message to react to. Accepts:
+                 - Signal username (e.g., "msh.60" or "u:msh.60")
+                 - Phone number (e.g., "+1234567890")
+                 - UUID (e.g., "e6cdcf80-e4ab-4c5a-9b4c-4627f53fa824")
+        target_timestamp: The timestamp of the message to react to (from MessageResponse)
+        emoji: The emoji to react with (default: "👍")
+
+    Returns:
+        Success or error response
+    """
+    logger.info(f"Tool called: send_reaction to {user_id} with {emoji}")
+
+    try:
+        daemon = _get_daemon()
+        success = await daemon.send_reaction(user_id, target_timestamp, emoji)
+        if success:
+            logger.info(f"Successfully sent reaction {emoji} to {user_id}")
+            return {"message": "Reaction sent successfully"}
+        logger.error(f"Failed to send reaction to {user_id}")
+        return {"error": "Failed to send reaction"}
+    except Exception as e:
+        logger.error(f"Error in send_reaction: {str(e)}", exc_info=True)
         return {"error": str(e)}
 
 
