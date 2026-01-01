@@ -5,8 +5,8 @@
 #     "mcp",
 # ]
 # ///
-from mcp.server.fastmcp import FastMCP
-from typing import Optional, Tuple, Dict, Union, Any, List
+from mcp.server.fastmcp import FastMCP, Context
+from typing import Optional, Tuple, Dict, Union, Any, List, Callable
 import asyncio
 import subprocess
 import shlex
@@ -1450,16 +1450,19 @@ async def list_chats() -> ListChatsResponse:
 
 
 @mcp.tool()
-async def ping_signal() -> Dict[str, Any]:
+async def ping_signal(custom_message: str = "Hot-reload test!") -> Dict[str, Any]:
     """Ping the Signal MCP server to verify it's working.
 
     This is a test tool added to demonstrate hot-reload capability.
     Returns server status, connection info, and current timestamp.
 
+    Args:
+        custom_message: Optional custom message to include in the response
+
     Returns:
         Dict with server status, user_id, daemon connection status, and timestamp
     """
-    logger.info("Tool called: ping_signal")
+    logger.info(f"Tool called: ping_signal with custom_message={custom_message}")
 
     try:
         daemon = _get_daemon()
@@ -1478,10 +1481,225 @@ async def ping_signal() -> Dict[str, Any]:
             "user_id": config.user_id,
             "daemon_connection": daemon_status,
             "timestamp": int(time.time() * 1000),
-            "message": "Signal MCP server is operational! Hot-reload is working! 🚀"
+            "message": f"Signal MCP server is operational! {custom_message}",
+            "signature_updated": True
         }
     except Exception as e:
         logger.error(f"Error in ping_signal: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": int(time.time() * 1000)
+        }
+
+
+# Dynamic tool registry - can be updated at runtime
+_dynamic_tools: Dict[str, Callable] = {}
+
+
+def register_dynamic_tool(name: str, handler: Callable) -> None:
+    """Register a new dynamic tool handler.
+
+    Args:
+        name: Name of the dynamic tool
+        handler: Async function to handle the tool execution
+    """
+    _dynamic_tools[name] = handler
+    logger.info(f"Registered dynamic tool: {name}")
+
+
+@mcp.tool()
+async def execute_dynamic_tool(tool_name: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Execute a dynamically registered tool by name.
+
+    This is a generic gateway tool that allows running custom functionality
+    without needing to restart Claude Code. New tools can be registered at runtime.
+
+    Args:
+        tool_name: Name of the dynamic tool to execute (e.g., "hello", "calculator")
+        params: JSON dictionary of parameters for the tool (optional)
+
+    Returns:
+        Result from the dynamic tool execution
+
+    Example usage:
+        execute_dynamic_tool(tool_name="hello", params={"name": "Alice"})
+    """
+    logger.info(f"Executing dynamic tool: {tool_name} with params: {params}")
+
+    if params is None:
+        params = {}
+
+    try:
+        if tool_name not in _dynamic_tools:
+            # List available tools
+            available = list(_dynamic_tools.keys()) if _dynamic_tools else ["(none registered yet)"]
+            return {
+                "status": "error",
+                "error": f"Unknown dynamic tool: {tool_name}",
+                "available_tools": available,
+                "hint": "Use register_dynamic_tool_handler to add new tools"
+            }
+
+        # Execute the registered handler
+        handler = _dynamic_tools[tool_name]
+        result = await handler(params) if asyncio.iscoroutinefunction(handler) else handler(params)
+
+        return {
+            "status": "success",
+            "tool_name": tool_name,
+            "result": result,
+            "timestamp": int(time.time() * 1000)
+        }
+
+    except Exception as e:
+        logger.error(f"Error executing dynamic tool {tool_name}: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "tool_name": tool_name,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "timestamp": int(time.time() * 1000)
+        }
+
+
+@mcp.tool()
+async def register_dynamic_tool_handler(tool_name: str, handler_code: str) -> Dict[str, Any]:
+    """Register a new dynamic tool handler at runtime.
+
+    This allows creating new tools on the fly by providing Python code.
+    The code should define an async function that takes a params dict.
+
+    Args:
+        tool_name: Name for the new dynamic tool
+        handler_code: Python code defining the handler function
+                     Should define a function named 'handler' that takes (params: dict)
+
+    Returns:
+        Registration status
+
+    Example:
+        handler_code = '''
+async def handler(params):
+    name = params.get("name", "World")
+    return {"message": f"Hello, {name}!"}
+'''
+    """
+    logger.info(f"Registering dynamic tool handler: {tool_name}")
+
+    try:
+        # Create a namespace for the handler code
+        namespace = {
+            "asyncio": asyncio,
+            "Dict": Dict,
+            "Any": Any,
+            "logger": logger,
+            "config": config,
+            "_get_daemon": _get_daemon,
+        }
+
+        # Execute the handler code
+        exec(handler_code, namespace)
+
+        # Get the handler function
+        if "handler" not in namespace:
+            return {
+                "status": "error",
+                "error": "Handler code must define a function named 'handler'",
+                "example": "async def handler(params):\\n    return {'result': 'value'}"
+            }
+
+        handler = namespace["handler"]
+        register_dynamic_tool(tool_name, handler)
+
+        return {
+            "status": "registered",
+            "tool_name": tool_name,
+            "message": f"Dynamic tool '{tool_name}' registered successfully",
+            "usage": f"execute_dynamic_tool(tool_name='{tool_name}', params={{...}})",
+            "timestamp": int(time.time() * 1000)
+        }
+
+    except Exception as e:
+        logger.error(f"Error registering dynamic tool {tool_name}: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "tool_name": tool_name,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "timestamp": int(time.time() * 1000)
+        }
+
+
+@mcp.tool()
+async def list_dynamic_tools() -> Dict[str, Any]:
+    """List all registered dynamic tools.
+
+    Returns:
+        List of available dynamic tool names
+    """
+    return {
+        "status": "ok",
+        "tools": list(_dynamic_tools.keys()),
+        "count": len(_dynamic_tools),
+        "timestamp": int(time.time() * 1000)
+    }
+
+
+@mcp.tool()
+async def create_dynamic_tool(ctx: Context) -> Dict[str, Any]:
+    """Create a new tool dynamically and notify Claude Code of the change.
+
+    This is an experiment to test if MCP tool list change notifications
+    can enable true hot-reload where new tools appear without restarting.
+
+    Returns:
+        Status of the dynamic tool creation and notification
+    """
+    logger.info("Tool called: create_dynamic_tool")
+
+    try:
+        # Define a new dynamic tool (this will add it to the tool manager)
+        @mcp.tool()
+        async def dynamic_hello(name: str = "World") -> Dict[str, str]:
+            """A dynamically created greeting tool.
+
+            Args:
+                name: Name to greet
+
+            Returns:
+                Greeting message
+            """
+            logger.info(f"Tool called: dynamic_hello with name={name}")
+            return {
+                "message": f"Hello, {name}! I was created dynamically!",
+                "created_at": int(time.time() * 1000)
+            }
+
+        logger.info("Dynamic tool 'dynamic_hello' has been created")
+
+        # Send the tool list changed notification to Claude Code
+        notification_sent = False
+        try:
+            # Access the session from the injected context
+            session = ctx.request_context.session
+            await session.send_tool_list_changed()
+            logger.info("Sent tool_list_changed notification to Claude Code")
+            notification_sent = True
+        except Exception as e:
+            logger.error(f"Failed to send tool_list_changed notification: {e}", exc_info=True)
+
+        return {
+            "status": "created",
+            "tool_name": "dynamic_hello",
+            "notification_sent": notification_sent,
+            "message": "Dynamic tool 'dynamic_hello' created." + (" Notification sent to Claude Code!" if notification_sent else " (Could not send notification - no active session)"),
+            "note": "Check if dynamic_hello appears without restarting Claude Code!",
+            "timestamp": int(time.time() * 1000)
+        }
+
+    except Exception as e:
+        logger.error(f"Error in create_dynamic_tool: {str(e)}", exc_info=True)
         return {
             "status": "error",
             "error": str(e),
@@ -1536,7 +1754,27 @@ def main():
     logger.info("Starting Signal MCP server")
     try:
         transport = run_mcp_server()
-        mcp.run(transport)
+
+        # EXPERIMENTAL: Enable dynamic tool list changes
+        # Override the server's initialization options to advertise tool list change capability
+        if transport == "stdio":
+            import anyio
+            from mcp.server.lowlevel.server import NotificationOptions
+            from mcp.server.stdio import stdio_server
+
+            async def run_with_notifications():
+                async with stdio_server() as (read_stream, write_stream):
+                    # Create initialization options with tools_changed=True
+                    init_options = mcp._mcp_server.create_initialization_options(
+                        notification_options=NotificationOptions(tools_changed=True),
+                        experimental_capabilities={}
+                    )
+                    logger.info("Starting MCP server with tools listChanged=True")
+                    await mcp._mcp_server.run(read_stream, write_stream, init_options)
+
+            anyio.run(run_with_notifications)
+        else:
+            mcp.run(transport)
     except Exception as e:
         logger.error(f"Error running Signal MCP server: {str(e)}", exc_info=True)
         raise
