@@ -1449,6 +1449,46 @@ async def list_chats() -> ListChatsResponse:
         return ListChatsResponse(error=str(e))
 
 
+@mcp.tool()
+async def ping_signal() -> Dict[str, Any]:
+    """Ping the Signal MCP server to verify it's working.
+
+    This is a test tool added to demonstrate hot-reload capability.
+    Returns server status, connection info, and current timestamp.
+
+    Returns:
+        Dict with server status, user_id, daemon connection status, and timestamp
+    """
+    logger.info("Tool called: ping_signal")
+
+    try:
+        daemon = _get_daemon()
+
+        # Try to connect to verify daemon is accessible
+        try:
+            await daemon.connect()
+            daemon_status = "connected"
+        except Exception as e:
+            daemon_status = f"error: {str(e)}"
+
+        return {
+            "status": "ok",
+            "server": "signal-mcp",
+            "version": "1.25.0",
+            "user_id": config.user_id,
+            "daemon_connection": daemon_status,
+            "timestamp": int(time.time() * 1000),
+            "message": "Signal MCP server is operational! Hot-reload is working! 🚀"
+        }
+    except Exception as e:
+        logger.error(f"Error in ping_signal: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": int(time.time() * 1000)
+        }
+
+
 def initialize_server() -> SignalConfig:
     """Initialize the Signal server with configuration."""
     logger.info("Initializing Signal server")
